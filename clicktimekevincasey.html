@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="initial-scale=1.0, user-scalable=no" />
+    <style type="text/css">
+      html { height: 100% }
+      body { height: 100%; margin: 0; padding: 0 }
+      #map-canvas { height: 90% }
+    </style>
+    <script type="text/javascript" src="https://maps.googleapis.com/maps/api/js?libraries=places& key=AIzaSyB7EKLXME4y5mGu_aCQaXzo8E0P7mLhxbI&sensor=true">
+    </script>
+  </head>
+  <body>
+    <div>
+      <!-- option select for mode of travel, triggers recomputation of directions.-->
+      <strong>Mode of Travel: </strong>
+      <select id="mode" onchange="getCurrentLocation();">
+        <option value="WALKING">Walking</option>
+        <option value="BICYCLING">Bicycling</option>
+        <option value="TRANSIT">Transit</option>
+        <!-- NO DRIVING <option value="DRIVING">Driving</option> -->
+      </select>
+    </div>
+    <!-- status message, append the directions to this. -->
+    <div id="directions">
+      Finding your current location...
+    </div>
+    <div id="map-canvas"/>
+    <script type="text/javascript">
+      var map;
+      var clicktimeAddress = '282 2nd Street 4th floor, San Francisco, CA 94105';
+      var clicktimeLatLng;
+      var geocoder = new google.maps.Geocoder();
+      var matrixService = new google.maps.DistanceMatrixService();
+      var infowindow;
+      var coffeeArr;
+      var donutArr;
+      var currentPosition;
+      var directionsService = new google.maps.DirectionsService();
+      var directionsDisplay = new google.maps.DirectionsRenderer();
+      var directionsDiv = document.getElementById('directions');
+
+      function initialize() {
+        var mapOptions = {
+          zoom: 15
+        };
+        map = new google.maps.Map(document.getElementById('map-canvas'), mapOptions);
+        infowindow = new google.maps.InfoWindow();
+        directionsDisplay.setMap(map);
+        directionsDisplay.setPanel(directionsDiv); // appends directions to div.
+
+        geocoder.geocode( { 'address': clicktimeAddress}, function(results, status) {
+          if (status == google.maps.GeocoderStatus.OK) {
+            clicktimeLatLng = results[0].geometry.location;
+            findNearbyPlaces(clicktimeLatLng, 'coffee');
+            findNearbyPlaces(clicktimeLatLng, 'donuts');
+          } else {
+            alert("Geocode was not successful for the following reason: " + status);
+          }
+        });
+
+        getCurrentLocation();
+
+      }
+
+      function findNearbyPlaces(location, identifier) {
+        map.setCenter(location);
+        var request = {
+          location: location,
+          radius: '1000', // So the coffee/donuts don't get cold! (1000 meters)
+          rankBy: google.maps.places.RankBy.PROMINENCE, // So we can take the most popular places
+          keyword: identifier,
+          types: ['store', 'bakery', 'cafe'], // Type of locations to get coffee/donuts
+          openNow: true // restrict to stores open at time of search.
+        };
+
+        service = new google.maps.places.PlacesService(map);
+        service.nearbySearch(request, searchCallback);
+      }
+
+      function searchCallback(results, status) {
+        if (status == google.maps.places.PlacesServiceStatus.OK) {
+          // only use the closest 4 most prominent that are close to ClickTime
+          results = results.slice(0, 4);
+          for (var i = 0; i < results.length; i++) {
+            var place = results[i];
+            setPin(place); // pinning the map, for reference.
+            // yanking out location from each place, makes it easier to work with
+            results[i] = place.geometry.location
+          }
+          if (coffeeArr) { // need to get both a coffee array and a donut array.
+            donutArr = results;
+            computeDirections(); // The arrays are ready.
+          } else {
+            coffeeArr = results
+          }
+        } else {
+          alert("search callback failed!");
+        }
+      }
+
+      function getCurrentLocation() {
+        directionsDiv.innerHTML = "Grabbing your current location..."
+        // Try HTML5 geolocation
+        if(navigator.geolocation) {
+          navigator.geolocation.getCurrentPosition(function(position) {
+            currentPosition = new google.maps.LatLng(position.coords.latitude, position.coords.longitude);
+            directionsDiv.innerHTML = "Computing the best path..."
+            computeDirections(); // the current position is ready.
+          }, function() {
+            alert("Oops, couldn't get your current location");
+          });
+        } else {
+          alert("Oops, your browser doesn't support Geolocation");
+        }
+      }
+
+      // if all the pieces are in place will solve the problem given the constraints.
+      function computeDirections() {
+        if (!donutArr || !coffeeArr || !currentPosition) {
+          return; // missing something, this function should be called again when another callback comes through
+        }
+        // This is somewhat convoluted.  Basically it generates a distance
+        // matrix in a single request to google.  I use this to parse together
+        // the best path to grab donuts and coffee.
+        // A cleaner solution would just grab the closest/random shops to ClickTime
+        var selectedMode = document.getElementById("mode").value;
+        if (selectedMode == 'TRANSIT') {
+          // Transit doesn't allow waypoints or distance matricies, try simplified :(
+          simplifiedComputeDirections(selectedMode);
+          return;
+        }
+        var shopsArr = coffeeArr.concat(donutArr)
+        var coffeeLen = coffeeArr.length;
+
+        // Matrix of distance, so we know distances from shops to currentPosition and clicktimeAddress
+        // and distances between coffee and donut shops.
+        matrixService.getDistanceMatrix(
+          {
+            origins: coffeeArr.concat([currentPosition, clicktimeAddress]),
+            destinations: shopsArr,
+            travelMode: google.maps.TravelMode[selectedMode],
+            unitSystem: google.maps.UnitSystem.METRIC,
+            durationInTraffic: false,
+            avoidHighways: false,
+            avoidTolls: false
+          }, matrixCallback);
+
+        function matrixCallback(response, status) {
+          if (status != google.maps.DistanceMatrixStatus.OK) {
+            directionsDiv.innerHTML = "FAILED!";
+            console.log('Error was: ' + status + ', trying simplified');
+            simplifiedComputeDirections(selectedMode); // Most likely matrix api overload.  Try simplified.
+            return;
+          }
+          // 
+          var min_dist = Number.MAX_VALUE;
+          var bestWaypoints;
+          var resultsFromCurr = response.rows[response.rows.length - 1].elements;
+          var resultsToClickTime = response.rows[response.rows.length - 2].elements;
+          var donutLen = donutArr.length;
+
+          // Trying TSP with all possible configurations.  This isn't a heavy computation
+          // since we know starting and ending point and we have capped the arrays
+          // to a maximum of 4 elements.
+          for(var coffeeShop=0; coffeeShop < coffeeArr.length; coffeeShop++) {
+            var coffeeIndex = coffeeShop;
+            var resultsFromCoffee = response.rows[coffeeIndex].elements;
+            for(var donutShop=0; donutShop < donutLen; donutShop++) {
+              var donutIndex = donutShop + coffeeLen;
+              var coffeeFirst = resultsFromCurr[coffeeIndex].distance.value; // curr -> coffee -> donut -> CT
+              coffeeFirst += resultsToClickTime[donutIndex].distance.value;
+              var donutFirst = resultsFromCurr[donutIndex].distance.value; // curr -> donut -> coffee -> CT
+              donutFirst += resultsToClickTime[coffeeIndex].distance.value;
+              var tempDist = Math.min(donutFirst, coffeeFirst);
+              tempDist += resultsFromCoffee[donutIndex].distance.value; // both paths go from coffee to donut
+              if (tempDist < min_dist) {
+                min_dist = tempDist;
+                bestWaypoints = [coffeeArr[coffeeIndex], donutArr[donutIndex - coffeeLen]];
+              }
+            }
+          }
+
+          setDirections(bestWaypoints[0], bestWaypoints[1], selectedMode);
+        }
+      }
+
+      // Actionally find the directions given a 'path.'  Displays route onscreen.
+      function setDirections(waypoint1, waypoint2, selectedMode) {
+        var waypoints = [{location: waypoint1}, {location: waypoint2}];
+        var request = {
+          origin:currentPosition,
+          destination:clicktimeAddress,
+          waypoints: waypoints,
+          optimizeWaypoints: true,
+          travelMode: google.maps.TravelMode[selectedMode]
+        };
+
+        directionsService.route(request, function(result, status) {
+          if (status == google.maps.DirectionsStatus.OK) {
+            directionsDisplay.setDirections(result);
+            directionsDiv.innerHTML = "DONE!";
+            console.log(result);
+          }
+        });
+      }
+
+      // Just grab the first coffee shop and donut shop...We don't
+      // really have a chance of doing better without overloading
+      // our requests to the api.
+      function simplifiedComputeDirections(selectedMode) {
+        setManualDirections(coffeeArr[0], donutArr[0], selectedMode);
+      }
+
+      // Really hacky solution to making a route with public transit.
+      function setManualDirections(coffeeShop, donutShop, selectedMode) {
+        var request = {
+          origin:currentPosition,
+          destination:donutShop,
+          travelMode: google.maps.TravelMode[selectedMode]
+        };
+
+        // pyramid of doom to compute the total directions to clicktime.
+        directionsService.route(request, function(donutResult, status) {
+          if (status == google.maps.DirectionsStatus.OK) {
+            var request = {
+              origin:donutShop,
+              destination:coffeeShop,
+              travelMode: google.maps.TravelMode[selectedMode],
+              provideRouteAlternatives: false
+            };
+
+            directionsService.route(request, function(coffeeResult, status) {
+              if (status == google.maps.DirectionsStatus.OK) {
+                var request = {
+                  origin:coffeeShop,
+                  destination:clicktimeAddress,
+                  travelMode: google.maps.TravelMode[selectedMode]
+                };
+
+                directionsService.route(request, function(clickTimeResult, status) {
+                  // Really hacky.  Reconstruct a path based on individual routes.
+                  var tb = {destination: clicktimeAddress, origin: currentPosition, travelMode: google.maps.TravelMode["WALKING"], waypoints: [{location: donutShop}, {location: coffeeShop}], waypoint_order: [0, 1]}
+                  console.log(tb.waypoints);
+                  var legs = donutResult.routes[0].legs.concat(coffeeResult.routes[0].legs).concat(clickTimeResult.routes[0].legs);
+                  var overviewPath = donutResult.routes[0].overview_path.concat(coffeeResult.routes[0].overview_path).concat(clickTimeResult.routes[0].overview_path);
+                  var route = donutResult.routes;
+                  route[0].legs = legs;
+                  route[0].overview_path = overviewPath;
+                  route[0].waypoint_order = [0, 1];
+                  var directions = {routes: route, status: status, Tb: tb};
+                  console.log(directions);
+                  directionsDisplay.setDirections(directions);
+                  directionsDiv.innerHTML = "DONE!";
+                });
+              }
+            });
+          }
+        });
+      }
+
+      // PIN HELPERS
+      function setPin(data) { 
+        var pinLatLng = new google.maps.LatLng(data.lng, data.lat); 
+        var pinMarker = new google.maps.Marker({ 
+          position: data.geometry.location, 
+          map: map, 
+          data: data.name
+        }); 
+
+        // Listen for click event  
+        google.maps.event.addListener(pinMarker, 'click', function() { 
+          map.setCenter(new google.maps.LatLng(pinMarker.position.lat(), pinMarker.position.lng())); 
+          map.setZoom(14); 
+          onItemClick(event, pinMarker); 
+        }); 
+      }
+
+      // Info window trigger function 
+      function onItemClick(event, pin) { 
+        // Create content  
+        var contentString = pin.data + "<br /><hr />Coordinate: " + pin.position;
+
+        // Replace our Info Window's content and position 
+        infowindow.setContent(contentString); 
+        infowindow.setPosition(pin.position); 
+        infowindow.open(map) 
+      } 
+
+      google.maps.event.addDomListener(window, 'load', initialize);
+
+    </script>
+  </body>
+</html>
